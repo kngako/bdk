@@ -1737,6 +1737,153 @@ impl Wallet {
         })
     }
 
+    /// Bump the fee of a transaction previously created with this wallet.
+    ///
+    pub fn build_additive_batch_bump(
+        &mut self,
+        txid: Txid,
+        script_pubkey: ScriptBuf, 
+        amount: u64
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, BuildFeeBumpError> {
+        let graph = self.indexed_graph.graph();
+        let txout_index = &self.indexed_graph.index;
+        let chain_tip = self.chain.tip().block_id();
+
+        let mut tx = graph
+            .get_tx(txid)
+            .ok_or(BuildFeeBumpError::TransactionNotFound(txid))?
+            .as_ref()
+            .clone();
+
+        let pos = graph
+            .get_chain_position(&self.chain, chain_tip, txid)
+            .ok_or(BuildFeeBumpError::TransactionNotFound(txid))?;
+        if let ChainPosition::Confirmed(_) = pos {
+            return Err(BuildFeeBumpError::TransactionConfirmed(txid));
+        }
+
+        if !tx
+            .input
+            .iter()
+            .any(|txin| txin.sequence.to_consensus_u32() <= 0xFFFFFFFD)
+        {
+            return Err(BuildFeeBumpError::IrreplaceableTransaction(
+                tx.compute_txid(),
+            ));
+        }
+
+        let fee = self
+            .calculate_fee(&tx)
+            .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
+        let fee_rate = self
+            .calculate_fee_rate(&tx)
+            .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
+
+        // remove the inputs from the tx and process them
+        let original_txin = tx.input.drain(..).collect::<Vec<_>>();
+        let original_utxos = original_txin
+            .iter()
+            .map(|txin| -> Result<_, BuildFeeBumpError> {
+                let prev_tx = graph
+                    .get_tx(txin.previous_output.txid)
+                    .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?;
+                let txout = &prev_tx.output[txin.previous_output.vout as usize];
+
+                let confirmation_time: ConfirmationTime = graph
+                    .get_chain_position(&self.chain, chain_tip, txin.previous_output.txid)
+                    .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?
+                    .cloned()
+                    .into();
+
+                let weighted_utxo = match txout_index.index_of_spk(txout.script_pubkey.clone()) {
+                    Some(&(keychain, derivation_index)) => {
+                        let satisfaction_weight = self
+                            .public_descriptor(keychain)
+                            .max_weight_to_satisfy()
+                            .unwrap();
+                        WeightedUtxo {
+                            utxo: Utxo::Local(LocalOutput {
+                                outpoint: txin.previous_output,
+                                txout: txout.clone(),
+                                keychain,
+                                is_spent: true,
+                                derivation_index,
+                                confirmation_time,
+                            }),
+                            satisfaction_weight,
+                        }
+                    }
+                    None => {
+                        let satisfaction_weight = Weight::from_wu_usize(
+                            serialize(&txin.script_sig).len() * 4 + serialize(&txin.witness).len(),
+                        );
+                        WeightedUtxo {
+                            utxo: Utxo::Foreign {
+                                outpoint: txin.previous_output,
+                                sequence: Some(txin.sequence),
+                                psbt_input: Box::new(psbt::Input {
+                                    witness_utxo: Some(txout.clone()),
+                                    non_witness_utxo: Some(prev_tx.as_ref().clone()),
+                                    ..Default::default()
+                                }),
+                            },
+                            satisfaction_weight,
+                        }
+                    }
+                };
+
+                Ok(weighted_utxo)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if tx.output.len() > 1 {
+            let mut change_index = None;
+            for (index, txout) in tx.output.iter().enumerate() {
+                let change_keychain = KeychainKind::Internal;
+                match txout_index.index_of_spk(txout.script_pubkey.clone()) {
+                    Some((keychain, _)) if *keychain == change_keychain => {
+                        change_index = Some(index)
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(change_index) = change_index {
+                tx.output.remove(change_index);
+            }
+        }
+
+        let mut recipients: Vec<(ScriptBuf, u64)> = tx
+        .output
+        .into_iter()
+        .map(|txout| (txout.script_pubkey, txout.value.to_sat()))
+        .collect();
+
+        // Add the new recipient... TODO: Some checks on what it is we just added...
+        recipients.push(
+            (script_pubkey, amount)
+        );
+
+        let params = TxParams {
+            // TODO: figure out what rbf option should be?
+            version: Some(tx_builder::Version(tx.version.0)),
+            recipients: recipients,
+            utxos: original_utxos,
+            bumping_fee: Some(tx_builder::PreviousFee {
+                absolute: fee.to_sat(),
+                rate: fee_rate,
+            }),
+            ..Default::default()
+        };
+
+        Ok(TxBuilder {
+            wallet: alloc::rc::Rc::new(core::cell::RefCell::new(self)),
+            params,
+            coin_selection: DefaultCoinSelectionAlgorithm::default(),
+        })
+    }
+
+
     /// Sign a transaction with all the wallet's signers, in the order specified by every signer's
     /// [`SignerOrdering`]. This function returns the `Result` type with an encapsulated `bool` that has the value true if the PSBT was finalized, or false otherwise.
     ///
