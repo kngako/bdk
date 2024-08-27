@@ -1845,18 +1845,15 @@ impl Wallet {
             .collect::<Result<Vec<_>, _>>()?;
 
         if tx.output.len() > 1 {
-            let mut change_index = None;
+            let mut change_indexes = vec![];
             for (index, txout) in tx.output.iter().enumerate() {
-                let change_keychain = KeychainKind::Internal;
-                match txout_index.index_of_spk(txout.script_pubkey.clone()) {
-                    Some((keychain, _)) if *keychain == change_keychain => {
-                        change_index = Some(index)
-                    }
-                    _ => {}
+                // Might be wrong doing this but works for my use case...
+                if self.is_mine(txout.script_pubkey.clone()) {
+                    change_indexes.push(index)
                 }
             }
 
-            if let Some(change_index) = change_index {
+            for change_index in change_indexes {
                 tx.output.remove(change_index);
             }
         }
