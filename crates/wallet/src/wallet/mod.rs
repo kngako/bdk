@@ -1755,21 +1755,6 @@ impl Wallet {
             .as_ref()
             .clone();
 
-        let fee = self
-            .calculate_fee(&tx)
-            .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
-        let fee_rate = self
-            .calculate_fee_rate(&tx)
-            .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
-
-        // Hacky way to get new output bumped...
-        tx.output.push(
-            TxOut { 
-                value: Amount::from_sat(amount), 
-                script_pubkey: script_pubkey
-            }
-        );
-
         let pos = graph
             .get_chain_position(&self.chain, chain_tip, txid)
             .ok_or(BuildFeeBumpError::TransactionNotFound(txid))?;
@@ -1786,6 +1771,13 @@ impl Wallet {
                 tx.compute_txid(),
             ));
         }
+
+        let fee = self
+            .calculate_fee(&tx)
+            .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
+        let fee_rate = self
+            .calculate_fee_rate(&tx)
+            .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
 
         // remove the inputs from the tx and process them
         let original_txin = tx.input.drain(..).collect::<Vec<_>>();
@@ -1857,6 +1849,14 @@ impl Wallet {
                 tx.output.remove(change_index);
             }
         }
+
+        // Add new TxOut that is being batched...
+        tx.output.push(
+            TxOut { 
+                value: Amount::from_sat(amount), 
+                script_pubkey: script_pubkey
+            }
+        );
 
         let params = TxParams {
             // TODO: figure out what rbf option should be?
