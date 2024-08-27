@@ -1755,6 +1755,14 @@ impl Wallet {
             .as_ref()
             .clone();
 
+        // Hacky way to get new output bumped...
+        tx.output.push(
+            TxOut { 
+                value: Amount::from_sat(amount), 
+                script_pubkey: script_pubkey
+            }
+        );
+
         let pos = graph
             .get_chain_position(&self.chain, chain_tip, txid)
             .ok_or(BuildFeeBumpError::TransactionNotFound(txid))?;
@@ -1853,21 +1861,14 @@ impl Wallet {
             }
         }
 
-        let mut recipients: Vec<(ScriptBuf, u64)> = tx
-        .output
-        .into_iter()
-        .map(|txout| (txout.script_pubkey, txout.value.to_sat()))
-        .collect();
-
-        // Add the new recipient... TODO: Some checks on what it is we just added...
-        recipients.push(
-            (script_pubkey, amount)
-        );
-
         let params = TxParams {
             // TODO: figure out what rbf option should be?
             version: Some(tx_builder::Version(tx.version.0)),
-            recipients: recipients,
+            recipients: tx
+                .output
+                .into_iter()
+                .map(|txout| (txout.script_pubkey, txout.value.to_sat()))
+                .collect(),
             utxos: original_utxos,
             bumping_fee: Some(tx_builder::PreviousFee {
                 absolute: fee.to_sat(),
